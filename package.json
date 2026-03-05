@@ -1,7 +1,7 @@
 {
-  "name": "pngtopgn-temp",
+  "name": "pngtopgn",
   "version": "1.0.0",
-  "main": "index.ts",
+  "main": "expo-router/entry",
   "scripts": {
     "start": "expo start",
     "android": "expo start --android",
@@ -9,10 +9,28 @@
     "web": "expo start --web"
   },
   "dependencies": {
+    "@tensorflow/tfjs": "^4.22.0",
+    "@tensorflow/tfjs-react-native": "^1.0.0",
+    "chess.js": "^1.4.0",
     "expo": "~55.0.5",
+    "expo-asset": "~55.0.8",
+    "expo-camera": "~55.0.9",
+    "expo-clipboard": "~55.0.8",
+    "expo-constants": "~55.0.7",
+    "expo-file-system": "~55.0.10",
+    "expo-gl": "~55.0.9",
+    "expo-haptics": "~55.0.8",
+    "expo-image-manipulator": "~55.0.9",
+    "expo-image-picker": "~55.0.11",
+    "expo-linking": "~55.0.7",
+    "expo-router": "~55.0.4",
+    "expo-sharing": "~55.0.11",
     "expo-status-bar": "~55.0.4",
     "react": "19.2.0",
-    "react-native": "0.83.2"
+    "react-native": "0.83.2",
+    "react-native-gesture-handler": "~2.30.0",
+    "react-native-safe-area-context": "~5.6.2",
+    "react-native-screens": "~4.23.0"
   },
   "devDependencies": {
     "@types/react": "~19.2.2",
