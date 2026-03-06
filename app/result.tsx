@@ -61,8 +61,10 @@ export default function ResultScreen() {
       await initModels();
 
       // Run the full pipeline: image → squares → inference → results
-      setLoadingStatus("Analyzing board position...");
-      const results = await runFullPipeline(imageUri, parsedCorners);
+      setLoadingStatus("Analyzing squares (0/64)...");
+      const results = await runFullPipeline(imageUri, parsedCorners, (done, total) => {
+        setLoadingStatus(`Analyzing squares (${done}/${total})...`);
+      });
       applyResults(results);
     } catch (err) {
       console.error("Inference error:", err);

@@ -1,93 +1,92 @@
 /**
- * Load and manage TF.js models for chess piece recognition.
+ * Load ONNX models for chess piece recognition.
  *
- * Creates functional CNN models on-device. When real chesscog weights
- * are converted (via scripts/convert_model.py), swap in the bundled
- * model files instead of the in-memory models below.
+ * Uses onnxruntime-react-native for on-device inference with
+ * chesscog's pre-trained weights (ResNet-18 + InceptionV3).
  */
 
-import * as tf from "@tensorflow/tfjs";
-import "@tensorflow/tfjs-react-native";
+import { InferenceSession } from "onnxruntime-react-native";
+import * as FileSystem from "expo-file-system";
+import { Asset } from "expo-asset";
 
 let isReady = false;
-let occupancyModel: tf.LayersModel | null = null;
-let pieceModel: tf.LayersModel | null = null;
+let occupancySession: InferenceSession | null = null;
+let pieceSession: InferenceSession | null = null;
 
-const SQUARE_SIZE = 50; // Input size for models (50x50 px)
+// Model input sizes (from chesscog configs)
+export const OCCUPANCY_SIZE = 100; // ResNet-18: 100x100
+export const PIECE_SIZE = 299; // InceptionV3: 299x299
+
+// ImageNet normalization (used by chesscog)
+export const IMAGENET_MEAN = [0.485, 0.456, 0.406];
+export const IMAGENET_STD = [0.229, 0.224, 0.225];
+
+// Piece class labels (from chesscog's InceptionV3.yaml, alphabetical order)
+export const PIECE_CLASSES = [
+  "b", // black_bishop
+  "k", // black_king
+  "n", // black_knight
+  "p", // black_pawn
+  "q", // black_queen
+  "r", // black_rook
+  "B", // white_bishop
+  "K", // white_king
+  "N", // white_knight
+  "P", // white_pawn
+  "Q", // white_queen
+  "R", // white_rook
+] as const;
 
 /**
- * Initialize TensorFlow.js backend and build/load models.
+ * Copy a bundled asset to a local file path that ONNX Runtime can read.
+ */
+async function getModelPath(assetModule: number): Promise<string> {
+  const [asset] = await Asset.loadAsync(assetModule);
+  if (asset.localUri) return asset.localUri;
+
+  // If no localUri, download to cache
+  const dest = `${FileSystem.Paths.cache.uri}/${asset.name}.${asset.type}`;
+  const file = new FileSystem.File(dest);
+  if (!file.exists) {
+    await FileSystem.File.downloadFileAsync(asset.uri!, new FileSystem.Directory(FileSystem.Paths.cache.uri));
+  }
+  return dest;
+}
+
+/**
+ * Initialize ONNX Runtime and load both models.
  */
 export async function initModels(): Promise<void> {
   if (isReady) return;
 
-  await tf.ready();
-  console.log("TF.js backend:", tf.getBackend());
+  console.log("Loading ONNX models...");
 
-  // Build in-memory models (untrained — replace with real weights later)
-  occupancyModel = buildOccupancyModel();
-  pieceModel = buildPieceModel();
+  try {
+    // Load occupancy model (ResNet-18, ~43MB)
+    const occPath = await getModelPath(require("../../assets/models/occupancy.onnx"));
+    occupancySession = await InferenceSession.create(occPath);
+    console.log("Occupancy model loaded");
 
-  isReady = true;
+    // Load piece model (InceptionV3, ~83MB)
+    const piecePath = await getModelPath(require("../../assets/models/pieces.onnx"));
+    pieceSession = await InferenceSession.create(piecePath);
+    console.log("Piece model loaded");
+
+    isReady = true;
+  } catch (err) {
+    console.error("Failed to load ONNX models:", err);
+    throw err;
+  }
 }
 
-/**
- * Binary classifier: is a square occupied?
- * Input: [batch, 50, 50, 3]  Output: [batch, 1] (sigmoid)
- */
-function buildOccupancyModel(): tf.LayersModel {
-  const model = tf.sequential();
-  model.add(tf.layers.conv2d({
-    inputShape: [SQUARE_SIZE, SQUARE_SIZE, 3],
-    filters: 16,
-    kernelSize: 3,
-    activation: "relu",
-  }));
-  model.add(tf.layers.maxPooling2d({ poolSize: 2 }));
-  model.add(tf.layers.conv2d({ filters: 32, kernelSize: 3, activation: "relu" }));
-  model.add(tf.layers.maxPooling2d({ poolSize: 2 }));
-  model.add(tf.layers.conv2d({ filters: 64, kernelSize: 3, activation: "relu" }));
-  model.add(tf.layers.globalAveragePooling2d({}));
-  model.add(tf.layers.dense({ units: 1, activation: "sigmoid" }));
-  model.compile({ optimizer: "adam", loss: "binaryCrossentropy" });
-  return model;
+export function getOccupancySession(): InferenceSession | null {
+  return occupancySession;
 }
 
-/**
- * 12-class classifier: which piece (6 types × 2 colors)?
- * Input: [batch, 50, 50, 3]  Output: [batch, 12] (softmax)
- *
- * Classes: P, N, B, R, Q, K, p, n, b, r, q, k
- */
-function buildPieceModel(): tf.LayersModel {
-  const model = tf.sequential();
-  model.add(tf.layers.conv2d({
-    inputShape: [SQUARE_SIZE, SQUARE_SIZE, 3],
-    filters: 32,
-    kernelSize: 3,
-    activation: "relu",
-  }));
-  model.add(tf.layers.maxPooling2d({ poolSize: 2 }));
-  model.add(tf.layers.conv2d({ filters: 64, kernelSize: 3, activation: "relu" }));
-  model.add(tf.layers.maxPooling2d({ poolSize: 2 }));
-  model.add(tf.layers.conv2d({ filters: 128, kernelSize: 3, activation: "relu" }));
-  model.add(tf.layers.globalAveragePooling2d({}));
-  model.add(tf.layers.dense({ units: 64, activation: "relu" }));
-  model.add(tf.layers.dense({ units: 12, activation: "softmax" }));
-  model.compile({ optimizer: "adam", loss: "categoricalCrossentropy" });
-  return model;
-}
-
-export function getOccupancyModel(): tf.LayersModel | null {
-  return occupancyModel;
-}
-
-export function getPieceModel(): tf.LayersModel | null {
-  return pieceModel;
+export function getPieceSession(): InferenceSession | null {
+  return pieceSession;
 }
 
 export function isModelReady(): boolean {
   return isReady;
 }
-
-export { SQUARE_SIZE };
