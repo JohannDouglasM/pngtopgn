@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """
-Two-stage board detection:
-1. Find outer board rectangle via contour detection (reliable)
-2. Warp to square, then find inner playing area boundary
+Board detection using contour finding + checkerboard validation.
+
+Algorithm:
+1. Generate multiple binary images (Canny, adaptive, OTSU, CLAHE, etc.)
+2. Find all quadrilateral contours that could be boards
+3. For each candidate, warp to square and score by checkerboard pattern
+4. Pick the candidate with the highest checkerboard score
+5. Optionally refine to inner playing area
 
 Usage: python3 training/detect_board_v5.py <image_path>
 """
@@ -26,159 +31,210 @@ def order_points(pts):
     return rect
 
 
-def get_binary_images(gray):
-    """Generate multiple binary images."""
+def checkerboard_score(image, corners):
+    """
+    Warp the image using corners and check if it looks like a checkerboard.
+    Returns a score from 0 (not a checkerboard) to 1 (perfect checkerboard).
+    """
+    warp_size = 400
+    dst = np.float32([[0, 0], [warp_size, 0], [warp_size, warp_size], [0, warp_size]])
+
+    try:
+        M = cv2.getPerspectiveTransform(corners, dst)
+        warped = cv2.warpPerspective(image, M, (warp_size, warp_size))
+    except cv2.error:
+        return 0.0
+
+    gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY) if len(warped.shape) == 3 else warped
+    sq = warp_size // 8
+
+    # Sample center of each square
+    values = np.zeros((8, 8))
+    for r in range(8):
+        for c in range(8):
+            cx = c * sq + sq // 2
+            cy = r * sq + sq // 2
+            margin = sq // 6  # sample a small region around center
+            region = gray[max(0, cy - margin):cy + margin, max(0, cx - margin):cx + margin]
+            if region.size == 0:
+                return 0.0
+            values[r, c] = np.mean(region)
+
+    # Check 1: Adjacent squares should alternate brightness
+    adj_diffs = 0
+    adj_total = 0
+    for r in range(8):
+        for c in range(7):
+            if abs(float(values[r, c]) - float(values[r, c + 1])) > 15:
+                adj_diffs += 1
+            adj_total += 1
+    for r in range(7):
+        for c in range(8):
+            if abs(float(values[r, c]) - float(values[r + 1, c])) > 15:
+                adj_diffs += 1
+            adj_total += 1
+    alternating_ratio = adj_diffs / adj_total if adj_total > 0 else 0
+
+    # Check 2: Same-parity squares should have similar brightness
+    # (light squares should all be light, dark squares all dark)
+    light_vals = []
+    dark_vals = []
+    for r in range(8):
+        for c in range(8):
+            if (r + c) % 2 == 0:
+                light_vals.append(values[r, c])
+            else:
+                dark_vals.append(values[r, c])
+
+    light_std = np.std(light_vals)
+    dark_std = np.std(dark_vals)
+    light_mean = np.mean(light_vals)
+    dark_mean = np.mean(dark_vals)
+
+    # Consistency: low std within each group = good
+    max_range = max(np.max(values) - np.min(values), 1)
+    consistency = 1.0 - (light_std + dark_std) / max_range
+    consistency = max(0, consistency)
+
+    # Separation: big difference between light and dark means = good
+    separation = abs(light_mean - dark_mean) / 255.0
+
+    # Combined score
+    score = alternating_ratio * 0.5 + consistency * 0.25 + separation * 0.25
+    return score
+
+
+def get_binary_images(gray, color_image=None):
+    """Generate multiple binary images for contour detection."""
+    h, w = gray.shape
+    kernel3 = np.ones((3, 3), np.uint8)
+
+    # Canny with different params
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    canny = cv2.Canny(blurred, 30, 100)
-    kernel = np.ones((3, 3), np.uint8)
-    yield cv2.dilate(canny, kernel, iterations=2)
+    for lo, hi in [(30, 100), (50, 150), (20, 80)]:
+        yield cv2.dilate(cv2.Canny(blurred, lo, hi), kernel3, iterations=2)
 
-    adaptive = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                      cv2.THRESH_BINARY_INV, 21, 5)
-    yield adaptive
+    # Adaptive threshold
+    yield cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                cv2.THRESH_BINARY_INV, 21, 5)
 
-    _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    yield otsu
+    # OTSU
+    yield cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
 
+    # CLAHE + Canny
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     enhanced = clahe.apply(gray)
-    canny2 = cv2.Canny(enhanced, 50, 150)
-    yield cv2.dilate(canny2, np.ones((3, 3), np.uint8), iterations=2)
+    for lo, hi in [(30, 100), (50, 150)]:
+        yield cv2.dilate(cv2.Canny(enhanced, lo, hi), kernel3, iterations=2)
 
+    # Bilateral filter + Canny (preserves edges, reduces texture)
     bilateral = cv2.bilateralFilter(gray, 11, 75, 75)
-    canny3 = cv2.Canny(bilateral, 30, 100)
-    yield cv2.dilate(canny3, np.ones((3, 3), np.uint8), iterations=2)
+    yield cv2.dilate(cv2.Canny(bilateral, 30, 100), kernel3, iterations=2)
+
+    # Morphological gradient
+    kernel5 = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    morph_grad = cv2.morphologyEx(gray, cv2.MORPH_GRADIENT, kernel5)
+    yield cv2.threshold(morph_grad, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+
+    # Color-based: HSV and LAB channels can detect board edges invisible in grayscale
+    # (e.g. wooden board on wooden floor — same brightness, different hue/saturation)
+    if color_image is not None:
+        hsv = cv2.cvtColor(color_image, cv2.COLOR_BGR2HSV)
+        lab = cv2.cvtColor(color_image, cv2.COLOR_BGR2LAB)
+        for channel in [hsv[:, :, 0], hsv[:, :, 1], lab[:, :, 1], lab[:, :, 2]]:
+            blurred_ch = cv2.GaussianBlur(channel, (5, 5), 0)
+            for lo, hi in [(30, 100), (20, 80)]:
+                yield cv2.dilate(cv2.Canny(blurred_ch, lo, hi), kernel3, iterations=2)
+
+        # Brightness segmentation: board is often lighter/darker than background
+        # Use morphological close+open to get a clean blob, then find its contour
+        kernel5 = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        l_ch = lab[:, :, 0]
+        for thresh_val in [90, 100, 110, 120]:
+            for inv in [False, True]:
+                flag = cv2.THRESH_BINARY_INV if inv else cv2.THRESH_BINARY
+                _, binary = cv2.threshold(l_ch, thresh_val, 255, flag)
+                binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel5, iterations=3)
+                binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel5, iterations=2)
+                yield binary
 
 
-def find_outer_board(gray, image):
-    """Stage 1: Find the outer board rectangle."""
+def find_candidates(gray, image):
+    """Find all quadrilateral contours that could be a chess board."""
     h, w = gray.shape
-    results = []
+    seen = set()  # Deduplicate similar candidates
+    candidates = []
 
-    for binary in get_binary_images(gray):
+    for binary in get_binary_images(gray, color_image=image):
         contours, _ = cv2.findContours(binary, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
         for cnt in contours:
             area = cv2.contourArea(cnt)
-            if area < h * w * 0.10 or area > h * w * 0.95:
+            # Board should be at least 5% of image (lowered from 10% for zoomed-out shots)
+            if area < h * w * 0.05 or area > h * w * 0.98:
                 continue
             peri = cv2.arcLength(cnt, True)
+            found_quad = False
             for eps_mult in [0.02, 0.03, 0.05, 0.08]:
                 approx = cv2.approxPolyDP(cnt, eps_mult * peri, True)
                 if len(approx) == 4:
                     pts = approx.reshape(4, 2).astype(np.float32)
                     ordered = order_points(pts)
+
+                    # Check aspect ratio
                     w1 = np.linalg.norm(ordered[1] - ordered[0])
                     w2 = np.linalg.norm(ordered[2] - ordered[3])
                     h1 = np.linalg.norm(ordered[3] - ordered[0])
                     h2 = np.linalg.norm(ordered[2] - ordered[1])
                     avg_w = (w1 + w2) / 2
                     avg_h = (h1 + h2) / 2
+                    if max(avg_w, avg_h) < 1:
+                        break
                     aspect = min(avg_w, avg_h) / max(avg_w, avg_h)
-                    if aspect > 0.6:
-                        results.append((area * aspect, ordered))
+
+                    if aspect > 0.55:
+                        # Deduplicate: round corners to nearest 20px
+                        key = tuple(np.round(ordered.flatten() / 20).astype(int))
+                        if key not in seen:
+                            seen.add(key)
+                            candidates.append(ordered)
+                    found_quad = True
                     break
 
-    if not results:
-        return None
-    results.sort(key=lambda x: x[0], reverse=True)
-    return results[0][1]
+            # Fallback: use minAreaRect for large blobs that don't approxPolyDP cleanly
+            if not found_quad and area > h * w * 0.15:
+                rect = cv2.minAreaRect(cnt)
+                rw, rh = rect[1]
+                if max(rw, rh) > 0 and min(rw, rh) / max(rw, rh) > 0.55:
+                    box = cv2.boxPoints(rect).astype(np.float32)
+                    # Clip to image bounds
+                    box[:, 0] = np.clip(box[:, 0], 0, w - 1)
+                    box[:, 1] = np.clip(box[:, 1], 0, h - 1)
+                    ordered = order_points(box)
+                    key = tuple(np.round(ordered.flatten() / 20).astype(int))
+                    if key not in seen:
+                        seen.add(key)
+                        candidates.append(ordered)
+
+    return candidates
 
 
-def find_inner_border(warped_gray, warp_size, debug_dir=None):
-    """
-    Stage 2: In the warped image, find where the playing area starts.
-    Scan from each edge inward looking for the dark border line or
-    the first checkerboard square edge.
-    """
+def find_inner_border(warped_gray, warp_size):
+    """Find inner playing area in warped image using variance-based detection."""
     s = warp_size
 
-    # The warped image should have the board roughly centered.
-    # The wooden border creates a light-colored margin around the playing area.
-    # The playing area starts with either a light or dark square at each corner.
-    # The dark border line (if present) is a thin dark line separating border from grid.
-
-    # Strategy: for each edge, find the strongest vertical/horizontal edge
-    # (the boundary between wooden border and playing area)
-
-    # Use Sobel gradients
-    sobel_x = cv2.Sobel(warped_gray, cv2.CV_64F, 1, 0, ksize=3)
-    sobel_y = cv2.Sobel(warped_gray, cv2.CV_64F, 0, 1, ksize=3)
-
-    # For left edge: scan columns from left, looking for strong vertical gradient
-    # For top edge: scan rows from top, looking for strong horizontal gradient
-    # etc.
-
-    margins = [0, 0, 0, 0]  # left, top, right, bottom
-
-    # Sample the central 60% to avoid corners
-    c_start = int(s * 0.2)
-    c_end = int(s * 0.8)
-
-    # Left margin: scan columns, look at vertical gradient
-    for col in range(s // 4):
-        grad_sum = np.mean(np.abs(sobel_x[c_start:c_end, col]))
-        if grad_sum > 30:
-            margins[0] = col
-            break
-
-    # Right margin: scan from right
-    for col in range(s - 1, s * 3 // 4, -1):
-        grad_sum = np.mean(np.abs(sobel_x[c_start:c_end, col]))
-        if grad_sum > 30:
-            margins[2] = s - 1 - col
-            break
-
-    # Top margin: scan rows
-    for row in range(s // 4):
-        grad_sum = np.mean(np.abs(sobel_y[row, c_start:c_end]))
-        if grad_sum > 30:
-            margins[1] = row
-            break
-
-    # Bottom margin: scan from bottom
-    for row in range(s - 1, s * 3 // 4, -1):
-        grad_sum = np.mean(np.abs(sobel_y[row, c_start:c_end]))
-        if grad_sum > 30:
-            margins[3] = s - 1 - row
-            break
-
-    return margins
-
-
-def find_inner_border_v2(warped_gray, warp_size, debug_dir=None):
-    """
-    Better approach: detect the checkerboard pattern to find where it starts.
-    A chess board has alternating light/dark squares. The variance along
-    a row/column shows peaks at square boundaries. We can detect where
-    these peaks first appear (= start of playing area).
-    """
-    s = warp_size
-
-    # Compute row-wise and column-wise variance in a sliding window
-    # The checkerboard creates a periodic high-low-high-low pattern
-    # The wooden border is mostly uniform (low variance)
-
-    # For each row, compute the standard deviation of pixel values
     row_std = np.array([np.std(warped_gray[r, :]) for r in range(s)])
     col_std = np.array([np.std(warped_gray[:, c]) for c in range(s)])
 
-    # The playing area rows/columns will have high std (alternating light/dark)
-    # The border rows/columns will have low std (uniform wood)
-
-    # Smooth to reduce noise
     kernel_size = max(3, s // 50)
     if kernel_size % 2 == 0:
         kernel_size += 1
-    row_std_smooth = np.convolve(row_std, np.ones(kernel_size)/kernel_size, mode='same')
-    col_std_smooth = np.convolve(col_std, np.ones(kernel_size)/kernel_size, mode='same')
+    row_std_smooth = np.convolve(row_std, np.ones(kernel_size) / kernel_size, mode='same')
+    col_std_smooth = np.convolve(col_std, np.ones(kernel_size) / kernel_size, mode='same')
 
-    # Find threshold: the playing area should have std > some threshold
-    # Use the median of the middle portion as reference
     mid_start, mid_end = s // 4, 3 * s // 4
     row_threshold = np.median(row_std_smooth[mid_start:mid_end]) * 0.5
     col_threshold = np.median(col_std_smooth[mid_start:mid_end]) * 0.5
 
-    # Find first/last row/col above threshold
     top = 0
     for r in range(s // 4):
         if row_std_smooth[r] > row_threshold:
@@ -203,44 +259,16 @@ def find_inner_border_v2(warped_gray, warp_size, debug_dir=None):
             right = c
             break
 
-    if debug_dir:
-        import matplotlib
-        matplotlib.use('Agg')
-        import matplotlib.pyplot as plt
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 6))
-        ax1.plot(row_std_smooth, label='row std')
-        ax1.axhline(y=row_threshold, color='r', linestyle='--', label='threshold')
-        ax1.axvline(x=top, color='g', linestyle='--', label=f'top={top}')
-        ax1.axvline(x=bottom, color='g', linestyle='--', label=f'bottom={bottom}')
-        ax1.set_title('Row-wise std')
-        ax1.legend()
-        ax2.plot(col_std_smooth, label='col std')
-        ax2.axhline(y=col_threshold, color='r', linestyle='--', label='threshold')
-        ax2.axvline(x=left, color='g', linestyle='--', label=f'left={left}')
-        ax2.axvline(x=right, color='g', linestyle='--', label=f'right={right}')
-        ax2.set_title('Col-wise std')
-        ax2.legend()
-        plt.tight_layout()
-        plt.savefig(str(debug_dir / "v5_variance_profile.png"))
-        plt.close()
-
     return left, top, right, bottom
 
 
-def find_inner_border_v3(warped_gray, warp_size, debug_dir=None):
-    """
-    Most robust: find the dark border line using edge detection in warped image.
-    After warping to the outer board, look for the largest inner rectangle.
-    """
+def find_inner_contour(warped_gray, warp_size):
+    """Find inner playing area rectangle via contour detection in warped image."""
     s = warp_size
-
-    # Look for the inner border line
     blurred = cv2.GaussianBlur(warped_gray, (5, 5), 0)
     edges = cv2.Canny(blurred, 30, 100)
-    kernel = np.ones((3, 3), np.uint8)
-    edges = cv2.dilate(edges, kernel, iterations=1)
+    edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
 
-    # Find contours
     contours, _ = cv2.findContours(edges, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
     best_corners = None
@@ -248,7 +276,6 @@ def find_inner_border_v3(warped_gray, warp_size, debug_dir=None):
 
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        # Inner rectangle should be 50-95% of warped image
         if area < s * s * 0.50 or area > s * s * 0.98:
             continue
         peri = cv2.arcLength(cnt, True)
@@ -260,26 +287,60 @@ def find_inner_border_v3(warped_gray, warp_size, debug_dir=None):
                 w1 = np.linalg.norm(ordered[1] - ordered[0])
                 h1 = np.linalg.norm(ordered[3] - ordered[0])
                 aspect = min(w1, h1) / max(w1, h1)
-                if aspect > 0.8:  # Should be very square for inner playing area
+                if aspect > 0.8:
                     score = area * aspect
                     if score > best_score:
                         best_score = score
                         best_corners = ordered
                 break
 
-    if debug_dir and best_corners is not None:
-        debug = cv2.cvtColor(warped_gray, cv2.COLOR_GRAY2BGR)
-        for i in range(4):
-            pt1 = tuple(best_corners[i].astype(int))
-            pt2 = tuple(best_corners[(i+1) % 4].astype(int))
-            cv2.line(debug, pt1, pt2, (0, 255, 0), 2)
-        cv2.imwrite(str(debug_dir / "v5_inner_contour.jpg"), debug)
-
     return best_corners
 
 
+def refine_to_inner(orig, outer_corners):
+    """Stage 2: Refine outer board corners to inner playing area."""
+    warp_size = 1000
+    dst = np.float32([[0, 0], [warp_size, 0],
+                      [warp_size, warp_size], [0, warp_size]])
+    M_outer = cv2.getPerspectiveTransform(outer_corners, dst)
+    warped = cv2.warpPerspective(orig, M_outer, (warp_size, warp_size))
+    warped_gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+
+    # Try variance-based
+    left, top, right, bottom = find_inner_border(warped_gray, warp_size)
+    margin_pct = [left / warp_size, top / warp_size,
+                  (warp_size - right) / warp_size, (warp_size - bottom) / warp_size]
+    margins_ok = all(0.005 < m < 0.15 for m in margin_pct)
+
+    # Try contour-based
+    inner_contour = find_inner_contour(warped_gray, warp_size)
+
+    if inner_contour is not None:
+        inner_pts = inner_contour
+    elif margins_ok:
+        inner_pts = np.float32([
+            [left, top], [right, top], [right, bottom], [left, bottom]
+        ])
+    else:
+        # No refinement needed / possible
+        return outer_corners
+
+    # Map inner points back to original coordinates
+    M_inv = cv2.getPerspectiveTransform(dst, outer_corners)
+    inner_pts_h = np.hstack([inner_pts, np.ones((4, 1))]).T
+    orig_pts = M_inv @ inner_pts_h
+    orig_pts = (orig_pts[:2] / orig_pts[2]).T
+
+    return orig_pts.astype(np.float32)
+
+
 def detect_board_corners(image_path, debug_dir=None):
-    """Two-stage board detection."""
+    """
+    Detect chess board corners.
+    1. Find all quadrilateral candidates
+    2. Score each by checkerboard pattern
+    3. Pick the best, refine to inner playing area
+    """
     image = cv2.imread(str(image_path))
     if image is None:
         raise ValueError(f"Could not read {image_path}")
@@ -295,105 +356,63 @@ def detect_board_corners(image_path, debug_dir=None):
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-    # Stage 1: Find outer board rectangle
-    outer_corners = find_outer_board(gray, image)
-    if outer_corners is None:
-        print("Stage 1 failed: could not find outer board!")
+    # Stage 1: Find all candidates
+    candidates = find_candidates(gray, image)
+    if not candidates:
+        print("No candidates found!")
         return None
 
-    outer_corners_orig = outer_corners / scale
-    print(f"Stage 1: outer board found")
+    print(f"Found {len(candidates)} candidates")
 
-    # Warp to square using outer corners
-    warp_size = 1000
-    dst = np.float32([[0, 0], [warp_size, 0],
-                      [warp_size, warp_size], [0, warp_size]])
-    M_outer = cv2.getPerspectiveTransform(outer_corners_orig, dst)
-    warped = cv2.warpPerspective(orig, M_outer, (warp_size, warp_size))
-    warped_gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+    # Stage 2: Score each candidate by checkerboard pattern
+    best_score = 0
+    best_corners = None
 
-    if debug_dir:
-        cv2.imwrite(str(debug_dir / "v5_01_warped_outer.jpg"), warped)
+    for corners in candidates:
+        # Scale corners back to original image coordinates
+        corners_orig = corners / scale
+        score = checkerboard_score(orig, corners_orig)
+        if score > best_score:
+            best_score = score
+            best_corners = corners_orig
 
-    # Stage 2: Find inner playing area
-    # Try multiple methods and pick the best
+    if best_corners is None or best_score < 0.15:
+        print(f"No good checkerboard found (best score: {best_score:.3f})")
+        return None
 
-    # Method A: Variance-based (checkerboard pattern detection)
-    left, top, right, bottom = find_inner_border_v2(warped_gray, warp_size, debug_dir)
-    print(f"Stage 2 (variance): margins L={left} T={top} R={warp_size-right} B={warp_size-bottom}")
+    print(f"Best checkerboard score: {best_score:.3f}")
 
-    # Method B: Contour-based (find inner rectangle)
-    inner_contour = find_inner_border_v3(warped_gray, warp_size, debug_dir)
-    if inner_contour is not None:
-        ic_left = min(inner_contour[0][0], inner_contour[3][0])
-        ic_top = min(inner_contour[0][1], inner_contour[1][1])
-        ic_right = max(inner_contour[1][0], inner_contour[2][0])
-        ic_bottom = max(inner_contour[2][1], inner_contour[3][1])
-        print(f"Stage 2 (contour): L={ic_left:.0f} T={ic_top:.0f} R={ic_right:.0f} B={ic_bottom:.0f}")
-
-    # Use the variance-based margins if they seem reasonable, else contour
-    # Reasonable = margins are 1-15% of image size
-    margin_pct = [left / warp_size, top / warp_size,
-                  (warp_size - right) / warp_size, (warp_size - bottom) / warp_size]
-    margins_ok = all(0.005 < m < 0.15 for m in margin_pct)
-
-    if inner_contour is not None:
-        # Use contour corners directly
-        inner_pts = inner_contour
-        print("Using contour-based inner border")
-    elif margins_ok:
-        inner_pts = np.float32([
-            [left, top], [right, top], [right, bottom], [left, bottom]
-        ])
-        print("Using variance-based inner border")
-    else:
-        # Fall back to outer with a small inset
-        inset = warp_size * 0.03
-        inner_pts = np.float32([
-            [inset, inset], [warp_size - inset, inset],
-            [warp_size - inset, warp_size - inset], [inset, warp_size - inset]
-        ])
-        print("Using default inset (3%)")
-
-    # Map inner points back to original coordinates
-    # inner_pts are in warped space, need to go back via inverse of M_outer
-    M_inv = cv2.getPerspectiveTransform(dst, outer_corners_orig)
-    inner_pts_h = np.hstack([inner_pts, np.ones((4, 1))]).T  # 3x4
-    orig_pts = M_inv @ inner_pts_h  # 3x4
-    orig_pts = (orig_pts[:2] / orig_pts[2]).T  # 4x2
-
-    final_corners = orig_pts.astype(np.float32)
+    # Stage 3: Refine to inner playing area
+    final_corners = refine_to_inner(orig, best_corners)
 
     if debug_dir:
-        # Show inner border on warped image
-        debug_warped = warped.copy()
-        for i in range(4):
-            pt1 = tuple(inner_pts[i].astype(int))
-            pt2 = tuple(inner_pts[(i+1) % 4].astype(int))
-            cv2.line(debug_warped, pt1, pt2, (0, 255, 0), 2)
-        cv2.imwrite(str(debug_dir / "v5_02_inner_border.jpg"), debug_warped)
+        debug_dir = Path(debug_dir)
+        debug_dir.mkdir(parents=True, exist_ok=True)
 
         # Show final corners on original
         debug_orig = orig.copy()
         labels = ["TL", "TR", "BR", "BL"]
         for i, (x, y) in enumerate(final_corners):
             cv2.circle(debug_orig, (int(x), int(y)), 15, (0, 255, 0), -1)
-            cv2.putText(debug_orig, labels[i], (int(x)+20, int(y)),
+            cv2.putText(debug_orig, labels[i], (int(x) + 20, int(y)),
                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
         for i in range(4):
             pt1 = tuple(final_corners[i].astype(int))
-            pt2 = tuple(final_corners[(i+1) % 4].astype(int))
+            pt2 = tuple(final_corners[(i + 1) % 4].astype(int))
             cv2.line(debug_orig, pt1, pt2, (0, 255, 0), 2)
-        cv2.imwrite(str(debug_dir / "v5_03_final_corners.jpg"), debug_orig)
+        cv2.imwrite(str(debug_dir / "v5_corners.jpg"), debug_orig)
 
         # Final warp with grid
-        M_final = cv2.getPerspectiveTransform(final_corners, dst)
-        warped_final = cv2.warpPerspective(orig, M_final, (warp_size, warp_size))
+        warp_size = 800
+        dst = np.float32([[0, 0], [warp_size, 0],
+                          [warp_size, warp_size], [0, warp_size]])
+        M = cv2.getPerspectiveTransform(final_corners, dst)
+        warped = cv2.warpPerspective(orig, M, (warp_size, warp_size))
         sq = warp_size // 8
         for i in range(9):
-            cv2.line(warped_final, (0, i*sq), (warp_size, i*sq), (0, 0, 255), 2)
-            cv2.line(warped_final, (i*sq, 0), (i*sq, warp_size), (0, 0, 255), 2)
-        cv2.imwrite(str(debug_dir / "v5_04_final_warped.jpg"), warped_final)
+            cv2.line(warped, (0, i * sq), (warp_size, i * sq), (0, 0, 255), 2)
+            cv2.line(warped, (i * sq, 0), (i * sq, warp_size), (0, 0, 255), 2)
+        cv2.imwrite(str(debug_dir / "v5_warped.jpg"), warped)
 
     return final_corners
 
