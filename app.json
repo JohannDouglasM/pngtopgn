@@ -39,8 +39,7 @@
           "cameraPermission": "Allow pngtopgn to access your camera to photograph chess boards."
         }
       ],
-      "expo-sharing",
-      "onnxruntime-react-native"
+      "expo-sharing"
     ]
   }
 }

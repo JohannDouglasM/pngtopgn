@@ -39,3 +39,18 @@ yarn-error.*
 # generated native folders
 /ios
 /android
+
+# datasets and large files
+*.zip
+*.pt
+*.onnx
+annotations.json
+
+# training artifacts
+training/debug_output/
+training/models/
+training/data/
+training/test-images-ref/
+
+# asset models (generated from training)
+assets/models/

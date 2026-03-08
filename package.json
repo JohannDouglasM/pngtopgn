@@ -9,8 +9,7 @@
     "web": "expo start --web"
   },
   "dependencies": {
-    "@tensorflow/tfjs": "^4.22.0",
-    "@tensorflow/tfjs-react-native": "^1.0.0",
+    "@anthropic-ai/sdk": "^0.39.0",
     "chess.js": "^1.4.0",
     "expo": "~55.0.5",
     "expo-asset": "~55.0.8",
@@ -26,6 +25,7 @@
     "expo-router": "~55.0.4",
     "expo-sharing": "~55.0.11",
     "expo-status-bar": "~55.0.4",
+    "jpeg-js": "^0.4.4",
     "onnxruntime-react-native": "^1.24.3",
     "react": "19.2.0",
     "react-native": "0.83.2",

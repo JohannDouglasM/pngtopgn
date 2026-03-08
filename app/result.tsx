@@ -18,22 +18,19 @@ import PieceEditor from "../src/components/PieceEditor";
 import { PieceType, SquareResult, buildFullFen, validateFen } from "../src/chess/fenBuilder";
 import { fenToPgn, lichessAnalysisUrl } from "../src/chess/pgnExporter";
 import { runFullPipeline } from "../src/ml/inference";
-import { initModels } from "../src/ml/modelLoader";
-import { Point } from "../src/vision/perspective";
 
 const FILE_LABELS = ["a", "b", "c", "d", "e", "f", "g", "h"];
 
 export default function ResultScreen() {
-  const { imageUri, corners } = useLocalSearchParams<{
+  const { imageUri } = useLocalSearchParams<{
     imageUri: string;
-    corners: string;
   }>();
 
   const [position, setPosition] = useState<(PieceType | null)[][]>(
     Array.from({ length: 8 }, () => Array(8).fill(null))
   );
   const [loading, setLoading] = useState(true);
-  const [loadingStatus, setLoadingStatus] = useState("Initializing models...");
+  const [loadingStatus, setLoadingStatus] = useState("Analyzing board...");
   const [editSquare, setEditSquare] = useState<{ row: number; col: number } | null>(null);
   const [activeColor, setActiveColor] = useState<"w" | "b">("w");
   const [copied, setCopied] = useState<string | null>(null);
@@ -48,22 +45,19 @@ export default function ResultScreen() {
   const runInference = async () => {
     setLoading(true);
     try {
-      // Parse corners from route params
-      const parsedCorners: Point[] = JSON.parse(corners ?? "[]");
-      if (parsedCorners.length !== 4 || !imageUri) {
-        Alert.alert("Error", "Missing image or corner data.");
+      if (!imageUri) {
+        Alert.alert("Error", "Missing image.");
         setLoading(false);
         return;
       }
 
-      // Initialize TF.js and models
-      setLoadingStatus("Loading ML models...");
-      await initModels();
-
-      // Run the full pipeline: image → squares → inference → results
-      setLoadingStatus("Analyzing squares (0/64)...");
-      const results = await runFullPipeline(imageUri, parsedCorners, (done, total) => {
-        setLoadingStatus(`Analyzing squares (${done}/${total})...`);
+      setLoadingStatus("Analyzing board...");
+      const results = await runFullPipeline(imageUri, (done, total) => {
+        if (done < total) {
+          setLoadingStatus("Analyzing board...");
+        } else {
+          setLoadingStatus("Done!");
+        }
       });
       applyResults(results);
     } catch (err) {

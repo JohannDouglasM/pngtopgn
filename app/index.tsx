@@ -16,7 +16,7 @@ export default function HomeScreen() {
       quality: 1,
     });
     if (!result.canceled && result.assets[0]) {
-      router.push({ pathname: "/corners", params: { imageUri: result.assets[0].uri } });
+      router.push({ pathname: "/result", params: { imageUri: result.assets[0].uri } });
     }
   };
 
@@ -26,7 +26,7 @@ export default function HomeScreen() {
       quality: 1,
     });
     if (!result.canceled && result.assets[0]) {
-      router.push({ pathname: "/corners", params: { imageUri: result.assets[0].uri } });
+      router.push({ pathname: "/result", params: { imageUri: result.assets[0].uri } });
     }
   };
 
