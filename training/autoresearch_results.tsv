@@ -1,0 +1,3 @@
+id	name	status	val_dist	elapsed_s	notes
+001	lr=0.0003	KEPT	0.019100	1613	
+002	lr=0.003	DISCARDED	0.019100	2786	

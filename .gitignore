@@ -48,9 +48,14 @@ annotations.json
 
 # training artifacts
 training/debug_output/
+training/debug_*
 training/models/
 training/data/
 training/test-images-ref/
+training/.autoresearch_backup
+training/canny_edges/
+training/collected_edges/
+training/memory/
 
 # asset models (generated from training)
 assets/models/
