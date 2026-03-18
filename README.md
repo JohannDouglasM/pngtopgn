@@ -4,7 +4,7 @@ React Native Expo app that recognizes chess positions from top-down photos and c
 
 ## Pipeline
 
-Photo → **Board Detection** (find 4 corners) → **Perspective Warp** → **Square Classification** (13 classes per square) → FEN → PGN/Lichess
+Photo → **Corner Detection** (find 4 board corners) → **Perspective Warp** → **Square Classification** (13 classes per square) → FEN → PGN/Lichess
 
 ## Project Structure
 
@@ -26,55 +26,45 @@ src/
     PieceEditor.tsx      # Manual piece correction UI
 
 training/                # Python training & evaluation scripts
-  detect_board_v5.py     # Board corner detection (CV-based, no ML)
-                         #   - Multi-method binary image generation
-                         #     (Canny, adaptive, OTSU, CLAHE, bilateral,
-                         #      morphological gradient, HSV/LAB color channels,
-                         #      brightness segmentation)
-                         #   - Quadrilateral contour finding + minAreaRect fallback
-                         #   - Checkerboard validation scoring (picks best candidate)
-                         #   - Inner border refinement (variance + contour based)
-                         #   - 100% detection on 600 images across 3 datasets
-  eval_board_detection.py    # Evaluate detection across datasets
-  inspect_failures.py        # Visual grid of failures/weak detections
-  test_v5_pipeline.py        # End-to-end test: detection → classification → FEN
-  train_corners.py           # Train ResNet-18 corner regression model
-  train_squares.py           # Train ResNet-18 square classifier (13 classes)
-  train_squares_v2.py        # V2 with sqrt class weights + strong augmentation
-  prepare_squares.py         # Extract per-square crops from annotated images
-                             #   (chesscog-style: variable height/width increase,
-                             #    col<4 horizontal flip, bottom-aligned padding)
-  prepare_squares_full.py    # Full dataset square preparation
-  prepare_all_data.py        # Download + prepare all datasets
-  download_datasets.py       # Dataset download helpers
-  dataset.py                 # PyTorch dataset classes
-  model.py                   # Model architecture definitions
-  eval_checkpoint.py         # Evaluate a saved checkpoint
-  evaluate.py                # General evaluation utilities
-  debug_crops.py             # Debug square cropping visually
-  annotate_corners.py        # Manual corner annotation tool
-  add_user_images.py         # Add user photos to training data
-  test_manual_corners.py     # Test with manually annotated corners
-  requirements.txt           # Python dependencies (torch, opencv, etc.)
+  train_corners_hybrid.py  # Train hybrid corner detector
+                           #   - 3-channel input: grayscale + Canny edges + square heatmap
+                           #   - ResNet-18 → Linear(512, 8) → Sigmoid
+                           #   - SmoothL1Loss, 2-phase training (head-only → fine-tune)
+  autoresearch.py          # Autonomous hyperparameter search loop
+                           #   - Patches train script → runs experiment → keeps/discards
+                           #   - Resumes from best checkpoint, logs to TSV
+  detect_board_v5.py       # CV-based board detection (fallback/reference)
+                           #   - Multi-method binary images + contour finding
+                           #   - Checkerboard validation + Sobel edge grid refinement
+  train_squares.py         # Train ResNet-18 square classifier (13 classes)
+  prepare_squares.py       # Extract per-square crops (chesscog-style)
+  prepare_all_data.py      # Download + prepare all datasets
+  eval_gt_corners.py       # Evaluate corner predictions against ground truth
+  annotate_corners.py      # Manual corner annotation tool
+  add_user_images.py       # Add user photos to training data
 
 assets/                  # App assets (images, model files)
 ```
 
 ## Current State
 
-### Board Detection (detect_board_v5.py) — STRONG
-- **100% detection rate** on 600 images (Kaggle, ChessReD2K, ChessReD datasets)
-- **97.2% good warps**, 0% bad warps
-- Works on: tournament boards, wooden boards, vinyl mats, rotated boards, low contrast, busy backgrounds
-- Algorithm: generate many binary images from different preprocessing methods → find all quad contours → score each by checkerboard pattern → pick best → refine to inner playing area
-- No ML model needed — pure OpenCV
+### Corner Detection — ACTIVE DEVELOPMENT
+- **Hybrid ML model**: ResNet-18 with 3-channel input (grayscale + Canny edges + square center heatmap)
+- **Best val_dist: 0.0198** (~60px mean error on 3072px images, ~2% diagonal)
+- Trained on ChessReD2K (1,447 train / 330 val)
+- Generalizes well to user's own photos (0.0200 norm_dist on 5 test images)
+- Autoresearch loop exploring hyperparameters (lr, dropout, head architecture, loss, augmentation, etc.)
+
+### CV Board Detection (detect_board_v5.py) — REFERENCE
+- 100% detection rate on 600 images across multiple datasets
+- Pure OpenCV, no ML model needed
+- Used as reference/fallback, being superseded by ML corner detector
 
 ### Square Classifier — NEEDS WORK
 - ResNet-18 trained on ChessReD2K tournament board squares
 - 13 classes: 6 white pieces + 6 black pieces + empty
 - ~92% accuracy on ChessReD2K validation set
 - ~65% accuracy on other chess sets (domain gap problem)
-- Crop style matters: must use exact chesscog-style cropping from prepare_squares.py
 
 ### On-Device Inference (src/ml/inference.ts)
 - Uses onnxruntime-react-native for model execution
@@ -84,31 +74,24 @@ assets/                  # App assets (images, model files)
 
 ## Models
 
-Both exported as ONNX (~43MB each), stored in `assets/models/` (gitignored):
-- **Corner model**: ResNet-18 → 8 floats (4 normalized corner coordinates). Input: 256x256
+Exported as ONNX (~43MB each), stored in `assets/models/` (gitignored):
+- **Corner model**: ResNet-18 → 8 floats (4 normalized corner coordinates). Input: 384x384 x 3ch
 - **Square classifier**: ResNet-18 → 13 classes. Input: 100x200 (WxH)
 
 ## Training Data
 
 All in `training/data/` (gitignored):
-- **ChessReD2K**: 1442 train / 330 val / 306 test images with corner + piece annotations
-- **ChessReD**: Similar format, different images
-- **Kaggle**: Synthetic chess board images with JSON sidecar annotations
-- Squares dataset: ~92k train / ~21k val crops extracted by prepare_squares.py
+- **ChessReD2K**: 1,447 train / 330 val / 306 test images with corner + piece annotations
+- **chess-dataset**: 500 real photos of green/white vinyl board with FEN labels (originals + preprocessed)
+- **User images**: 5 manually annotated board photos
 
 ## Key Technical Decisions
 
-1. **Two-stage pipeline** (detect corners → classify squares) instead of end-to-end model — more interpretable, each stage independently improvable
-2. **Checkerboard validation** as candidate selection criterion — warps each candidate rectangle and checks for alternating light/dark pattern. This is what made detection robust
-3. **No ML for board detection** — CV-based approach with many preprocessing methods is more generalizable than a trained corner regression model
-4. **Chesscog-style square cropping** — variable height/width margins based on row/col position, horizontal flip for left-side columns, bottom-aligned padding. Must match exactly between training and inference
-5. **On-device only** — no cloud APIs, all inference via ONNX Runtime
+1. **Two-stage pipeline** (detect corners → classify squares) — each stage independently improvable
+2. **3-channel hybrid input** for corner detection — grayscale for appearance, Canny for edges, heatmap for board structure
+3. **On-device only** — no cloud APIs, all inference via ONNX Runtime
+4. **Chesscog-style square cropping** — variable height/width margins, horizontal flip for left columns, bottom-aligned padding
 
 ## Next Steps
 
-1. **Improve square classifier generalization** — the main bottleneck. Options:
-   - Train on more diverse datasets (different board/piece styles)
-   - Domain adaptation / data augmentation
-   - Fine-tune on user's specific board
-2. Orientation detection (which way is the board facing)
-3. Move suggestion / game analysis integration
+See [TODO.md](TODO.md)
